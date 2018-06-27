@@ -5,6 +5,7 @@ package ftp
 
 import (
 	"bufio"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -31,10 +32,12 @@ type ServerConn struct {
 	DisableEPSV bool
 
 	conn          *textproto.Conn
+	tconn         net.Conn
 	host          string
 	timeout       time.Duration
 	features      map[string]string
 	mlstSupported bool
+	tlsEnabled    bool
 }
 
 // Entry describes a file and is returned by List().
@@ -84,6 +87,7 @@ func DialTimeout(addr string, timeout time.Duration) (*ServerConn, error) {
 
 	c := &ServerConn{
 		conn:     conn,
+		tconn:    tconn,
 		host:     host,
 		timeout:  timeout,
 		features: make(map[string]string),
@@ -281,8 +285,11 @@ func (c *ServerConn) openDataConn() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	return net.DialTimeout("tcp", net.JoinHostPort(c.host, strconv.Itoa(port)), c.timeout)
+	if c.tlsEnabled {
+		return tls.Dial("tcp", net.JoinHostPort(c.host, strconv.Itoa(port)), &tls.Config{ InsecureSkipVerify: true })
+	} else {
+		return net.DialTimeout("tcp", net.JoinHostPort(c.host, strconv.Itoa(port)), c.timeout)
+	}
 }
 
 // cmd is a helper function to execute a command and check for the expected FTP
@@ -298,10 +305,16 @@ func (c *ServerConn) cmd(expected int, format string, args ...interface{}) (int,
 
 // cmdDataConnFrom executes a command which require a FTP data connection.
 // Issues a REST FTP command to specify the number of bytes to skip for the transfer.
-func (c *ServerConn) cmdDataConnFrom(offset uint64, format string, args ...interface{}) (net.Conn, error) {
-	conn, err := c.openDataConn()
-	if err != nil {
-		return nil, err
+func (c *ServerConn) cmdDataConnFrom(offset uint64, format string, args ...interface{}) (conn net.Conn, err error) {
+
+	var port int
+	if !c.tlsEnabled {
+		conn, err = c.openDataConn()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		port, err = c.getDataConnPort()
 	}
 
 	if offset != 0 {
@@ -314,21 +327,50 @@ func (c *ServerConn) cmdDataConnFrom(offset uint64, format string, args ...inter
 
 	_, err = c.conn.Cmd(format, args...)
 	if err != nil {
-		conn.Close()
+
 		return nil, err
 	}
 
 	code, msg, err := c.conn.ReadResponse(-1)
 	if err != nil {
-		conn.Close()
 		return nil, err
 	}
 	if code != StatusAlreadyOpen && code != StatusAboutToSend {
-		conn.Close()
 		return nil, &textproto.Error{Code: code, Msg: msg}
 	}
 
+	if c.tlsEnabled {
+		conn, err = tls.Dial("tcp", net.JoinHostPort(c.host, strconv.Itoa(port)), &tls.Config{ InsecureSkipVerify: true })
+		if err != nil {
+			return nil, err
+		}
+	}
+	
 	return conn, nil
+}
+
+// AuthTLS issues an AUTH TLS command. 
+func (c *ServerConn) AuthTLS() (err error) {
+	_, _, err = c.cmd(StatusEnteringAuth, "AUTH TLS")
+	if nil == err {
+		c.tlsEnabled = true
+		tlsconn := tls.Client(c.tconn, &tls.Config{ InsecureSkipVerify: true })
+		err = tlsconn.Handshake()
+		if nil == err {
+			c.conn = textproto.NewConn(tlsconn)
+		}
+	}
+	return
+}
+
+func (c *ServerConn) ProtTLS() (err error) {
+	_, _, err = c.cmd(StatusCommandOK, "PROT P")
+	return
+}
+
+func (c *ServerConn) NOOP() (err error) {
+	_, _, err = c.cmd(StatusCommandOK, "NOOP")
+	return 
 }
 
 // NameList issues an NLST FTP command.
